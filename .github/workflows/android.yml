@@ -1,25 +1,44 @@
-name: Android CI
+name: Android Pre-release
 
 on:
   workflow_dispatch:
-  push:
-    branches: ["main"]
-    tags:
-      - "v*"
-    paths-ignore:
-      - "README.md"
-      - "doc/*"
-      - ".github/workflows/android.yml"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      version-name: ${{ steps.package.outputs.version-name }}
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
 
     steps:
+      - name: Validate Signing Configuration
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          ALIAS: ${{ secrets.ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          for secret_name in SIGNING_KEY KEY_STORE_PASSWORD ALIAS KEY_PASSWORD; do
+            if [[ -z "${!secret_name}" ]]; then
+              echo "::error::Missing required secret: $secret_name"
+              exit 1
+            fi
+          done
+
       - name: Checkout Repository
         uses: actions/checkout@v7
         with:
+          # versionCode is calculated from the Git commit count.
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up JDK 21
         uses: actions/setup-java@v5
@@ -31,30 +50,134 @@ jobs:
         uses: gradle/actions/setup-gradle@v6
 
       - name: Decode Signing Key
-        run: echo ${{ secrets.SIGNING_KEY }} | base64 -d > keystore.jks
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        run: |
+          umask 077
+          keystore_path="$RUNNER_TEMP/appmarket-release.jks"
+          printf '%s' "$SIGNING_KEY" | base64 --decode > "$keystore_path"
+          test -s "$keystore_path"
 
       - name: Build Release APK
-        run: |
-          ./gradlew :app:android:assembleRelease
-          echo "APK_FILE=$(find app/android/build/outputs/apk/release -name '*.apk' | head -n 1)" >> $GITHUB_ENV
+        run: ./gradlew :app:android:assembleRelease --no-daemon --stacktrace
         env:
-          KEYSTORE_PATH: ${{ github.workspace }}/keystore.jks
+          KEYSTORE_PATH: ${{ runner.temp }}/appmarket-release.jks
           KEYSTORE_PASS: ${{ secrets.KEY_STORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
-      - name: Upload APK Artifact
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      - name: Remove Signing Key
+        if: ${{ always() }}
+        run: rm -f -- "$RUNNER_TEMP/appmarket-release.jks"
+
+      - name: Prepare Release Files
+        id: package
+        run: |
+          version_name=$(python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          metadata = json.loads(Path("app/android/build/outputs/apk/release/output-metadata.json").read_text())
+          versions = {element["versionName"] for element in metadata["elements"]}
+          if len(versions) != 1:
+              raise SystemExit("Expected one versionName across all release APKs")
+          version = versions.pop()
+          if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._+-]*", version):
+              raise SystemExit("APK versionName is not suitable for a release tag")
+          print(version)
+          PY
+          )
+          printf 'version-name=%s\n' "$version_name" >> "$GITHUB_OUTPUT"
+
+          mapfile -d '' apks < <(find app/android/build/outputs/apk/release -type f -name '*.apk' -print0)
+          if (( ${#apks[@]} == 0 )); then
+            echo "::error::No release APKs were produced"
+            exit 1
+          fi
+          mkdir -p dist
+          for apk in "${apks[@]}"; do
+            test -s "$apk"
+            destination="dist/$(basename "$apk")"
+            if [[ -e "$destination" ]]; then
+              echo "::error::Duplicate APK filename: $(basename "$apk")"
+              exit 1
+            fi
+            cp -- "$apk" "$destination"
+          done
+          (
+            cd dist
+            sha256sum -- *.apk > SHA256SUMS
+          )
+          {
+            printf '### APK SHA256 checksums\n\n```text\n'
+            cat dist/SHA256SUMS
+            printf '```\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Release Files
+        id: upload
         uses: actions/upload-artifact@v7
         with:
-          path: ${{ env.APK_FILE }}
-          archive: false
+          name: android-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
 
-      - name: Display APK Hashes
+      - name: Upload R8 Mapping
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-mapping-${{ github.run_id }}-${{ github.run_attempt }}
+          path: app/android/build/outputs/mapping/release/mapping.txt
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download Release Files
+        uses: actions/download-artifact@v8
+        with:
+          # The ID also works when only the failed publish job is rerun.
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          path: dist
+          merge-multiple: true
+
+      - name: Verify APK Checksums
+        working-directory: dist
+        run: sha256sum --check --strict SHA256SUMS
+
+      - name: Publish Pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION_NAME: ${{ needs.build.outputs.version-name }}
         run: |
-          echo "### APK Hashes" >> $GITHUB_STEP_SUMMARY
-          echo "| Hash Type | Hash Value |" >> $GITHUB_STEP_SUMMARY
-          echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
-          echo "| SHA256 | \`$(sha256sum "$APK_FILE" | awk '{ print $1 }')\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| SHA1 | \`$(sha1sum "$APK_FILE" | awk '{ print $1 }')\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| MD5 | \`$(md5sum "$APK_FILE" | awk '{ print $1 }')\` |" >> $GITHUB_STEP_SUMMARY
+          tag="v${VERSION_NAME}-beta.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          repository_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          {
+            printf 'Android pre-release built from version **%s**.\n\n' "$VERSION_NAME"
+            printf -- '- Commit: [%s](%s/commit/%s)\n' "$GITHUB_SHA" "$repository_url" "$GITHUB_SHA"
+            printf -- '- Build: [Run %s, attempt %s](%s/actions/runs/%s/attempts/%s)\n\n' \
+              "$GITHUB_RUN_NUMBER" "$GITHUB_RUN_ATTEMPT" "$repository_url" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf '### SHA256 checksums\n\n```text\n'
+            cat dist/SHA256SUMS
+            printf '```\n'
+          } > "$notes_file"
+
+          # Publish only after all release assets have been uploaded successfully.
+          gh release create "$tag" dist/*.apk dist/SHA256SUMS \
+            --target "$GITHUB_SHA" \
+            --title "AppMarket $tag" \
+            --notes-file "$notes_file" \
+            --draft --prerelease --latest=false
+          gh release edit "$tag" --draft=false --prerelease --latest=false
+
+          printf '### Pre-release\n\n[%s](%s/releases/tag/%s)\n' \
+            "$tag" "$repository_url" "$tag" >> "$GITHUB_STEP_SUMMARY"
